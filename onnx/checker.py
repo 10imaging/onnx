@@ -8,147 +8,78 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-import itertools
-import logging
+import functools
 
-from onnx.onnx_pb2 import TensorProto, ValueInfoProto, NodeProto, \
-    GraphProto, ModelProto, IR_VERSION
-from onnx import defs, mapping
-
-
-def check_node(node):
-    """Checks if a node is legal.
-
-    Inputs:
-        node: a NodeProto object.
-    Returns:
-        None
-    An exception is thrown if it does not pass the test.
-    """
-    # General checks.
-    if not isinstance(node, NodeProto):
-        raise RuntimeError('You cannot pass an object that is not NodeProto.')
-    if not node.op_type:
-        raise NameError('NodeProto does not have a proper op_type set.')
-    if not node.input and not node.output:
-        raise ValueError('NodeProto has zero input and zero output.')
-    if not defs.has(node.op_type):
-        raise NameError(
-            'Node op_type {} not recognized by onnx.'.format(node.op_type))
-    if not defs.get_schema(node.op_type).verify(node.SerializeToString()):
-        raise ValueError(
-            'NodeProto of type {} did not pass defs schema check.'.format(str(node.op_type)))
-    for attr in node.attribute:
-        if attr.HasField('t'):
-            check_tensor(attr.t)
-        for tensor in attr.tensors:
-            check_tensor(tensor)
+from onnx import (ValueInfoProto,
+                  AttributeProto,
+                  TensorProto,
+                  NodeProto,
+                  ModelProto,
+                  GraphProto,
+                  IR_VERSION)
+import onnx.onnx_cpp2py_export.checker as C
+import onnx.defs
+from google.protobuf.message import Message
+from typing import TypeVar, Callable, Any, Type, cast
 
 
-def check_tensor_value_info(value_info,
-                            type_required=True,
-                            shape_required=True):
-    if not isinstance(value_info, ValueInfoProto):
-        raise RuntimeError('You cannot pass an object that is not ValueInfoProto.')
-    if not value_info.name:
-        raise NameError('ValueInfoProto must have its name set.')
-
-    if not type_required and not shape_required:
-        return
-    if not value_info.HasField('type'):
-        raise ValueError('type field of ValueInfoProto is missing')
-    value = value_info.type.WhichOneof('value')
-
-    if value == 'tensor_type':
-        if type_required and not value_info.type.tensor_type.HasField('elem_type'):
-            raise ValueError('elem_type field of TensorTypeProto is missing')
-        if shape_required and not value_info.type.tensor_type.HasField('shape'):
-            raise ValueError('shape field of TensorTypeProto is missing')
-    elif value == 'sparse_tensor_type':
-        if type_required and \
-           not value_info.type.sparse_tensor_type.HasField('elem_type'):
-            raise ValueError('elem_type field of SparseTensorTypeProto is missing')
-        if shape_required and not value_info.type.sparse_tensor_type.HasField('shape'):
-            raise ValueError('shape field of SparseTensorTypeProto is missing')
-    else:
-        raise ValueError(
-            'TypeProto.value should be either tensor_type or sparse_tensor_type')
+# TODO: This thing where we reserialize the protobuf back into the
+# string, only to deserialize it at the call site, is really goofy.
+# Stop doing that.
 
 
-def check_tensor(tensor):
-    if not isinstance(tensor, TensorProto):
-        raise RuntimeError('You cannot pass an object that is not TensorProto.')
-
-    fields = [field
-              for field in set(mapping.STORAGE_TENSOR_TYPE_TO_FIELD.values())
-              if getattr(tensor, field)]
-    has_raw_field = tensor.HasField('raw_data')
-    if has_raw_field:
-        fields.append('raw_data')
-
-    if len(fields) != 1:
-        raise ValueError(
-            'There should be exactly one data field set: {}'.format(
-                ', '.join(fields)))
-
-    if has_raw_field:
-        if tensor.data_type == TensorProto.STRING:
-            raise ValueError(
-                'STRING data should not be stored in "raw_data" field')
-    else:
-        field = fields[0]
-        if field != mapping.STORAGE_TENSOR_TYPE_TO_FIELD[
-                mapping.TENSOR_TYPE_TO_STORAGE_TENSOR_TYPE[tensor.data_type]]:
-            raise ValueError(
-                'Mismatched data type ({}) and field ({})'.format(
-                    tensor.data_type, field
-                ))
+# NB: Please don't edit this context!
+DEFAULT_CONTEXT = C.CheckerContext()
+DEFAULT_CONTEXT.ir_version = IR_VERSION
+# TODO: Maybe ONNX-ML should also be defaulted?
+DEFAULT_CONTEXT.opset_imports = {'': onnx.defs.onnx_opset_version()}
 
 
-def check_graph(graph):
-    """Checks if a GraphProto is legal.
-
-    Inputs:
-        graph: a GraphProto object.
-    Returns:
-        None
-    An exception is thrown if it does not pass the test.
-    """
-    if not isinstance(graph, GraphProto):
-        raise RuntimeError('You cannot pass an object that is not GraphProto.')
-    if not graph.name:
-        raise NameError(
-            'The graph does not have a proper name set.')
-    for value_info in itertools.chain(graph.input, graph.output):
-        check_tensor_value_info(value_info)
-    for value_info in graph.value_info:
-        check_tensor_value_info(value_info)
-    for node in graph.node:
-        check_node(node)
-
-    input_names = {value_info.name for value_info in graph.input}
-    for init in graph.initializer:
-        if init.name not in input_names:
-            raise ValueError(
-                '{} in initializer but not in graph input'.format(init.name))
-        check_tensor(init)
+FuncType = TypeVar('FuncType', bound=Callable[..., Any])
 
 
-def check_model(model):
-    """Checks if a ModelProto is legal.
+# TODO: This really doesn't seem worth the metaprogramming...
+def _create_checker(proto_type):  # type: (Type[Message]) -> Callable[[FuncType], FuncType]
+    def decorator(py_func):  # type: (FuncType) -> FuncType
+        @functools.wraps(py_func)
+        def checker(proto, ctx=DEFAULT_CONTEXT):  # type: (Message, C.CheckerContext) -> Any
+            if not isinstance(proto, proto_type):
+                raise RuntimeError(
+                    'You cannot pass an object that is not of type {}'.format(
+                        proto_type.__name__))
+            return getattr(C, py_func.__name__)(
+                proto.SerializeToString(), ctx)
+        return cast(FuncType, checker)
+    return decorator
 
-    Inputs:
-        model: a ModelProto object.
-    Returns:
-        None
-    An exception is thrown if it does not pass the test.
-    """
-    if not isinstance(model, ModelProto):
-        raise RuntimeError('You cannot pass an object that is not ModelProto.')
-    if not model.HasField('ir_version'):
-        raise ValueError('The model does not have an ir_version set properly.')
-    if model.ir_version > IR_VERSION:
-        logging.warning(
-            'Your model ir_version is higher than the checker\'s, so it might '
-            'not interpret the higher version correctly.')
-    check_graph(model.graph)
+
+@_create_checker(ValueInfoProto)
+def check_value_info(value_info, ctx=DEFAULT_CONTEXT):  # type: (ValueInfoProto, C.CheckerContext) -> None
+    pass
+
+
+@_create_checker(TensorProto)
+def check_tensor(tensor, ctx=DEFAULT_CONTEXT):  # type: (TensorProto, C.CheckerContext) -> None
+    pass
+
+
+@_create_checker(AttributeProto)
+def check_attribute(attr, ctx=DEFAULT_CONTEXT):  # type: (AttributeProto, C.CheckerContext) -> None
+    pass
+
+
+@_create_checker(NodeProto)
+def check_node(node, ctx=DEFAULT_CONTEXT):  # type: (NodeProto, C.CheckerContext) -> None
+    pass
+
+
+@_create_checker(GraphProto)
+def check_graph(graph, ctx=DEFAULT_CONTEXT):  # type: (GraphProto, C.CheckerContext) -> None
+    pass
+
+
+def check_model(model):  # type: (ModelProto) -> None
+    C.check_model(model.SerializeToString())
+
+
+ValidationError = C.ValidationError

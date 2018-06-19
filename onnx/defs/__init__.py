@@ -3,22 +3,32 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-import onnx.onnx_cpp2py_export as C
+import onnx
+from onnx import AttributeProto
+import onnx.onnx_cpp2py_export.defs as C
 
 
-def has(op_type):
-    return C.has_schema(op_type)
+ONNX_DOMAIN = ""
 
 
-def get_schema(op_type):
-    return C.get_schema(op_type)
+has = C.has_schema
+get_schema = C.get_schema
+get_all_schemas = C.get_all_schemas
+get_all_schemas_with_history = C.get_all_schemas_with_history
 
 
-def get_all_schemas():
-    return C.get_all_schemas()
+def onnx_opset_version():  # type: () -> int
+    return C.schema_version_map()[ONNX_DOMAIN][1]
 
-
-def verify(schema, node_proto):
-    return schema.verify(node_proto.SerializeToString())
 
 OpSchema = C.OpSchema
+
+
+@property  # type: ignore
+def _Attribute_default_value(self):  # type: ignore
+    attr = AttributeProto()
+    attr.ParseFromString(self._default_value)
+    return attr
+
+
+OpSchema.Attribute.default_value = _Attribute_default_value  # type: ignore

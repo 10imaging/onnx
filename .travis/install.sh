@@ -1,12 +1,9 @@
 #!/bin/bash
 
-scripts_dir=$(dirname $(readlink -e "${BASH_SOURCE[0]}"))
-source "$scripts_dir/common"
+script_path=$(python -c "import os; import sys; print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}")
+source "${script_path%/*}/setup.sh"
 
-# install protobuf
-pb_dir="$build_cache_dir/pb"
-mkdir -p $pb_dir
-wget -qO- "https://github.com/google/protobuf/releases/download/v$PB_VERSION/protobuf-$PB_VERSION.tar.gz" | tar -xvz -C "$pb_dir" --strip-components 1
-ccache -z
-cd "$pb_dir" && ./configure && make && make check && sudo make install && sudo ldconfig
-ccache -s
+export ONNX_BUILD_TESTS=1
+pip install protobuf numpy
+time CMAKE_ARGS="-DONNX_WERROR=ON" ONNX_NAMESPACE=ONNX_NAMESPACE_FOO_BAR_FOR_CI python  setup.py bdist_wheel --universal --dist-dir .
+find . -maxdepth 1 -name "*.whl" -ls -exec pip install {} \;

@@ -1,445 +1,654 @@
 // Copyright (c) Facebook Inc. and Microsoft Corporation.
 // Licensed under the MIT license.
 
-#include "schema.h"
+#include "onnx/defs/schema.h"
+#include <stdexcept>
 #include <unordered_set>
+#include "onnx/checker.h"
+#include "onnx/defs/operator_sets.h"
 
-namespace onnx {
+#ifdef ONNX_ML
+#include "onnx/defs/operator_sets-ml.h"
+#endif
 
-bool OpSchema::Verify(const NodeProto& node) const {
+#include "onnx/common/assertions.h"
+#include "onnx/common/stl_backports.h"
+
+namespace ONNX_NAMESPACE {
+
+void RegisterSchema(OpSchema&& schema) {
+  OpSchemaRegistry::OpSchemaRegisterOnce(registration) = schema;
+}
+
+#ifndef NDEBUG
+DbgOperatorSetTracker& DbgOperatorSetTracker::Instance() {
+  static DbgOperatorSetTracker instance;
+  return instance;
+}
+#endif
+
+OpSchema::FormalParameter::FormalParameter(
+    std::string name,
+    DataTypeSet allowed_type_set,
+    std::string type_str,
+    std::string description,
+    FormalParameterOption param_option)
+    : name_(std::move(name)),
+      type_set_(std::move(allowed_type_set)),
+      type_str_(std::move(type_str)),
+      description_(std::move(description)),
+      param_option_(param_option) {}
+
+OpSchema::FormalParameter::FormalParameter(
+    std::string name,
+    std::string description,
+    std::string type_str,
+    FormalParameterOption param_option)
+    : name_(std::move(name)),
+      type_str_(std::move(type_str)),
+      description_(std::move(description)),
+      param_option_(param_option) {}
+
+const std::string& OpSchema::FormalParameter::GetName() const {
+  return name_;
+}
+
+const DataTypeSet& OpSchema::FormalParameter::GetTypes() const {
+  return type_set_;
+}
+
+DataTypeSet& OpSchema::FormalParameter::MutableTypes() {
+  return type_set_;
+}
+
+const std::string& OpSchema::FormalParameter::GetTypeStr() const {
+  return type_str_;
+}
+
+const std::string& OpSchema::FormalParameter::GetDescription() const {
+  return description_;
+}
+
+OpSchema::FormalParameterOption OpSchema::FormalParameter::GetOption() const {
+  return param_option_;
+}
+
+OpSchemaRegistry* OpSchemaRegistry::Instance() {
+  static OpSchemaRegistry instance;
+  return &instance;
+}
+
+void OpSchema::Verify(const NodeProto& node) const {
   // Check the number of inputs.
   if (node.input_size() < min_input_ || node.input_size() > max_input_) {
-    std::cerr << "Input size " << node.input_size()
-                    << " not in range [min=" << min_input_ << ", max="
-                    << max_input_ << "].";
-    return false;
+    fail_check(
+        "Input size ",
+        node.input_size(),
+        " not in range [min=",
+        min_input_,
+        ", max=",
+        max_input_,
+        "].");
   }
+
   if (!num_inputs_allowed_(node.input_size())) {
-    std::cerr << "Input size " << node.input_size()
-                    << " not in allowed input sizes.";
-    return false;
+    fail_check(
+        "Input size ", node.input_size(), " not in allowed input sizes.");
   }
+
   // Check the number of outputs.
   if (node.output_size() < min_output_ || node.output_size() > max_output_) {
-    std::cerr << "Output size " << node.output_size()
-                    << " not in range [min=" << min_output_ << ", max="
-                    << max_output_ << "].";
-    return false;
+    fail_check(
+        "Output size ",
+        node.output_size(),
+        " not in range [min=",
+        min_output_,
+        ", max=",
+        max_output_,
+        "].");
   }
+
   if (!num_outputs_allowed_(node.output_size())) {
-    std::cerr << "Output size " << node.output_size()
-                    << " not in allowed output sizes.";
-    return false;
+    fail_check(
+        "Output size ", node.output_size(), " not in allowed output sizes.");
   }
-  if (!num_inputs_outputs_allowed_(node.input_size(), node.output_size())) {
-    std::cerr << "Combination of input size " << node.input_size()
-               << "and output size " << node.output_size() << " not in allowed.";
-    return false;
-  }
-  // If the number of outputs can be calculated, check if the number matches.
-  if (calculate_output_) {
-    int expected_nout = calculate_output_(node.input_size());
-    if (expected_nout != kCannotComputeNumOutputs &&
-        node.output_size() != expected_nout) {
-      std::cerr << "Output size " << node.output_size()
-                      << " not matching expected output size, which is "
-                      << expected_nout;
-      return false;
+
+  // Check the values of inputs / outputs
+  for (int in_idx = 0; in_idx < node.input_size(); ++in_idx) {
+    if (in_idx >= static_cast<int>(inputs_.size())) {
+      if (inputs_.size() > 0 && Variadic == inputs_.back().GetOption()) {
+        // The last input formal parameter should be variadic.
+        break;
+      } else {
+        fail_check(
+            "Node (",
+            node.name(),
+            ") has more inputs (",
+            node.input_size(),
+            ") than declared (",
+            inputs_.size(),
+            ") in op definition.");
+      }
+    }
+    if (node.input(in_idx).empty() && (Single == inputs_[in_idx].GetOption())) {
+      fail_check(
+          "Input ",
+          in_idx,
+          " is marked single but has an empty string in the graph");
     }
   }
 
+  for (int out_idx = 0; out_idx < node.output_size(); ++out_idx) {
+    if (out_idx >= static_cast<int>(outputs_.size())) {
+        if (outputs_.size() > 0 && Variadic == outputs_.back().GetOption()) {
+            // The last output formal parameter should be variadic.
+            break;
+        }
+        else {
+            fail_check(
+                "Node (",
+                node.name(),
+                ") has more outputs (",
+                node.output_size(),
+                ") than declared (",
+                outputs_.size(),
+                ") in op definition.");
+        }
+    }
+
+    if (node.output(out_idx).empty() &&
+        (Single == outputs_[out_idx].GetOption())) {
+      fail_check(
+          "Output ",
+          out_idx,
+          " is marked single but has an empty string in the graph");
+    }
+  }
+
+  // An internal symbol is defined as starting with two underscores. Attributes
+  // with names meeting this condition are considered implementation details
+  // and should be ignored for the purpose of schema checking.
+  auto isInternalSymbol = [](const std::string& sym) -> bool {
+    return sym.length() >= 2 && sym[0] == '_' && sym[1] == '_';
+  };
+
   // Check attributes
   std::unordered_set<std::string> seen_attr_names{};
-  const AttributeProto * consume_attr = nullptr;
-
   for (const auto& attr_proto : node.attribute()) {
-      const auto& name = attr_proto.name();
+    const auto& name = attr_proto.name();
 
-      if (!seen_attr_names.insert(name).second) {
-          std::cerr << "Attribute '"
-                    << name
-                    << "' appeared multiple times.";
-          return false;
-      };
+    if (!seen_attr_names.insert(name).second) {
+      fail_check("Attribute '", name, "' appeared multiple times.");
+    };
 
-      if (!IsAttributeLegal(attr_proto)) {
-          std::cerr << "Attribute '"
-                    << name
-                    << "' is not legal"
-                    << std::endl;
-          return false;
-      }
+    const auto& search = attributes_.find(name);
+    AttributeProto::AttributeType expected_type;
+    if (search != attributes_.end()) {
+      expected_type = search->second.type;
+    } else if (allows_unchecked_attributes_ || isInternalSymbol(name)) {
+      continue;
+    } else {
+      fail_check("Unrecognized attribute: ", name, " for operator ", node.op_type());
+    }
 
-      const auto& search = attributes_.find(name);
-      AttrType expected_type;
-      if (search != attributes_.end()) {
-          expected_type = search->second.type;
-      } else if (allows_unchecked_attributes_){
-        continue;
-      } else if (name == "consumed_inputs") {
-          expected_type = AttrType::INTS;
-          consume_attr = &attr_proto;
-          if(attr_proto.ints().size() != node.input_size()) {
-            std::cerr << "Attribute consumed_inputs (length "
-                      << attr_proto.ints().size()
-                      << ") is not the same length as inputs (length "
-                      << node.input_size() << ")" << std::endl;
-            return false;
-          }
-      } else {
-          std::cerr << "Unrecognized attribute: " << name << std::endl;
-          return false;
-      }
-
-      switch (expected_type) {
-      case AttrType::FLOAT:
-          if (!attr_proto.has_f()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'f'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::INT:
-          if (!attr_proto.has_i()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'i'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::STRING:
-          if (!attr_proto.has_s()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 's'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::TENSOR:
-          if (!attr_proto.has_t()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 't'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::GRAPH:
-          if (!attr_proto.has_g()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'g'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::FLOATS:
-          if (!attr_proto.floats_size()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'floats'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::INTS:
-          if (!attr_proto.ints_size()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'ints'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::STRINGS:
-          if (!attr_proto.strings_size()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'strings'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::TENSORS:
-          if (!attr_proto.tensors_size()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'tensors'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      case AttrType::GRAPHS:
-          if (!attr_proto.graphs_size()) {
-              std::cerr << "Attribute '"
-                        << name
-                        << "' is expected to have field 'graphs'"
-                        << std::endl;
-              return false;
-          }
-          break;
-      }
+    switch (expected_type) {
+      case AttributeProto::FLOAT:
+        if (!attr_proto.has_f()) {
+          fail_check("Attribute '", name, "' is expected to have field 'f'");
+        }
+        break;
+      case AttributeProto::INT:
+        if (!attr_proto.has_i()) {
+          fail_check("Attribute '", name, "' is expected to have field 'i'");
+        }
+        break;
+      case AttributeProto::STRING:
+        if (!attr_proto.has_s()) {
+          fail_check("Attribute '", name, "' is expected to have field 's'");
+        }
+        break;
+      case AttributeProto::TENSOR:
+        if (!attr_proto.has_t()) {
+          fail_check("Attribute '", name, "' is expected to have field 't'");
+        }
+        break;
+      case AttributeProto::GRAPH:
+        if (!attr_proto.has_g()) {
+          fail_check("Attribute '", name, "' is expected to have field 'g'");
+        }
+        break;
+      case AttributeProto::FLOATS:
+        if (!attr_proto.floats_size()) {
+          fail_check(
+              "Attribute '", name, "' is expected to have field 'floats'");
+        }
+        break;
+      case AttributeProto::INTS:
+        if (!attr_proto.ints_size()) {
+          fail_check("Attribute '", name, "' is expected to have field 'ints'");
+        }
+        break;
+      case AttributeProto::STRINGS:
+        if (!attr_proto.strings_size()) {
+          fail_check(
+              "Attribute '", name, "' is expected to have field 'strings'");
+        }
+        break;
+      case AttributeProto::TENSORS:
+        if (!attr_proto.tensors_size()) {
+          fail_check(
+              "Attribute '", name, "' is expected to have field 'tensors'");
+        }
+        break;
+      case AttributeProto::GRAPHS:
+        if (!attr_proto.graphs_size()) {
+          fail_check(
+              "Attribute '", name, "' is expected to have field 'graphs'");
+        }
+        break;
+      default:
+        fail_check("Attribute '", name, " has unknown expected type");
+    }
   }
   for (const auto& pair : attributes_) {
-      const auto& attr = pair.second;
-      if (!attr.required) {
-          continue;
-      }
-      if (!seen_attr_names.count(attr.name)) {
-          std::cerr << "Required attribute '"
-                    << attr.name
-                    << "' is missing." << std::endl;
-          return false;
-      }
-  }
-
-
-  // Check in-place settings.
-  for (int in_idx = 0; in_idx < node.input_size(); ++in_idx) {
-    bool consumed = consume_attr ? consume_attr->ints(in_idx) : false;
-    auto use_type = consumed_(in_idx);
-    switch(use_type.first) {
-      case UseType::DEFAULT:
-        if(consumed) {
-          std::cerr << "Input index " << in_idx << " is set to consumed but "
-                    << "is not supported by op " << node.op_type();
-          return false;
-        } break;
-      case UseType::CONSUME_ENFORCED:
-        if(!consumed) {
-          std::cerr << "Input index " << in_idx << " must be set to consumed "
-                    << "for operator " << node.op_type();
-          return false;
-        } break;
-      case UseType::CONSUME_ALLOWED:
-        // pass, either is allowed
-        break;
+    const auto& attr = pair.second;
+    if (!attr.required) {
+      continue;
+    }
+    if (!seen_attr_names.count(attr.name)) {
+      fail_check("Required attribute '", attr.name, "' is missing.");
     }
   }
 
   // Phew. All verifications passed.
-  return true;
 }
 
-bool OpSchema::IsAttributeLegal(const AttributeProto& proto) {
-    if (proto.name().empty()) {
-        std::cerr << "Attribute should set name field." << std::endl;
-        return false;
-    }
-
-    int used_fields =
-        proto.has_f() +
-        proto.has_i() +
-        proto.has_s() +
-        proto.has_t() +
-        proto.has_g() +
-        (proto.floats_size() > 0) +
-        (proto.ints_size() > 0) +
-        (proto.strings_size() > 0) +
-        (proto.tensors_size() > 0) +
-        (proto.graphs_size() > 0);
-    if (used_fields != 1) {
-        std::cerr << "Attribute should contain one and only one value field.\n"
-                  << "AttributeProto:\n"
-                  << proto.SerializeAsString()
-                  << "\n"
-                  << std::endl;
-        return false;
-    }
-    return true;
-}
-
-OpSchema& OpSchema::NumInputs(int min, int max) {
-  min_input_ = min;
-  max_input_ = max;
-  return *this;
-}
-
-OpSchema& OpSchema::NumInputs(int n) {
-  return NumInputs(n, n);
-}
-
-OpSchema& OpSchema::NumInputs(std::function<bool(int)> func) {
-  num_inputs_allowed_ = func;
+OpSchema& OpSchema::SinceVersion(OperatorSetVersion v) {
+  since_version_ = v;
   return *this;
 }
 
 OpSchema& OpSchema::NumInputs(std::set<int> allowed_input_nums) {
-  return NumInputs(
-      [allowed_input_nums](int n)->bool {
-        return allowed_input_nums.count(n);
-      });
-}
-
-OpSchema& OpSchema::NumOutputs(int min, int max) {
-  min_output_ = min;
-  max_output_ = max;
-  return *this;
-}
-
-OpSchema& OpSchema::NumOutputs(int n) {
-  return NumOutputs(n, n);
-}
-
-OpSchema& OpSchema::NumOutputs(std::function<bool(int)> func) {
-  num_outputs_allowed_ = func;
+  num_inputs_allowed_ = [MOVE_CAPTURE_IF_CPP14(allowed_input_nums)](int n) -> bool {
+    return allowed_input_nums.count(n);
+  };
   return *this;
 }
 
 OpSchema& OpSchema::NumOutputs(std::set<int> allowed_output_nums) {
-  return NumOutputs(
-      [allowed_output_nums](int n)->bool {
-        return allowed_output_nums.count(n);
-      });
-}
-
-OpSchema& OpSchema::NumInputsOutputs(std::function<bool(int, int)> func) {
-  num_inputs_outputs_allowed_ = func;
-  return *this;
-}
-
-OpSchema& OpSchema::OutputCalculator(std::function<int(int)> calc) {
-  calculate_output_ = calc;
-  return *this;
-}
-
-OpSchema& OpSchema::SameNumberOfOutput() {
-  return OutputCalculator([](int n)->int { return n; } );
-}
-
-OpSchema& OpSchema::AllowConsumed(std::function<std::pair<bool,int>(int)> inplace) {
-  consumed_ = [inplace](int idx) {
-    auto r = inplace(idx);
-    return std::make_pair(
-      r.first ? UseType::CONSUME_ALLOWED : UseType::DEFAULT,
-      r.second);
+  num_outputs_allowed_ = [MOVE_CAPTURE_IF_CPP14(allowed_output_nums)](int n) -> bool {
+    return allowed_output_nums.count(n);
   };
   return *this;
 }
 
-OpSchema& OpSchema::AllowConsumed(std::unordered_map<int, int> inplace) {
-  return AllowConsumed(
-      [inplace](int idx) {
-        auto it = inplace.find(idx);
-        if(it != inplace.end()) {
-          return std::make_pair(true, it->second);
-        }
-        return std::make_pair(false,0);
-      });
-}
-
-OpSchema& OpSchema::AllowOneToOneConsumed() {
-  return AllowConsumed([](int i){
-    return std::make_pair(true,i);
-  });
-}
-
-OpSchema& OpSchema::EnforceConsumed(std::function<std::pair<bool,int>(int)> inplace) {
-  consumed_ = [inplace](int idx) {
-    auto r = inplace(idx);
-    return std::make_pair(
-      r.first ? UseType::CONSUME_ENFORCED : UseType::DEFAULT,
-      r.second);
-  };
+OpSchema& OpSchema::TypeAndShapeInferenceFunction(InferenceFunction inferenceFunction) {
+  tensor_inference_function_ = inferenceFunction;
   return *this;
-}
-
-OpSchema& OpSchema::EnforceConsumed(std::unordered_map<int, int> inplace) {
-  return EnforceConsumed(
-      [inplace](int idx) {
-        auto it = inplace.find(idx);
-        if(it != inplace.end()) {
-          return std::make_pair(true, it->second);
-        }
-        return std::make_pair(false,0);
-      });
-}
-
-OpSchema& OpSchema::EnforceOneToOneConsumed() {
-  return EnforceConsumed([](int i){
-    return std::make_pair(true,i);
-  });
 }
 
 OpSchema& OpSchema::SetSupportLevel(SupportType support) {
-    support_ = support;
-    return *this;
-}
-
-OpSchema& OpSchema::SetDoc(const std::string& doc) {
-  doc_ = doc;
+  support_ = support;
   return *this;
 }
 
-OpSchema& OpSchema::Attr(const Attribute& attr) {
-  attributes_.insert(std::make_pair(attr.name, attr));
+OpSchema& OpSchema::SetDoc(std::string doc) {
+  doc_ = std::move(doc);
   return *this;
 }
 
-OpSchema& OpSchema::Attr(const char* name,
-                         const char* description,
-                         AttrType type,
-                         bool required) {
-  Attr(Attribute{name, description, type, required});
+// Functions to specify name for the operator schema.
+OpSchema& OpSchema::SetName(std::string name) {
+  name_ = std::move(name);
   return *this;
 }
+
+OpSchema& OpSchema::SetName(const char* name) {
+  return SetName(std::string(name));
+}
+
+// Functions to specify code location for the operator schema.
+OpSchema& OpSchema::SetLocation(std::string file, int line) {
+  file_ = std::move(file);
+  line_ = line;
+  return *this;
+}
+
+OpSchema& OpSchema::SetLocation(const char* file, int line) {
+  return SetLocation(std::string(file), line);
+}
+
+OpSchema& OpSchema::SetDomain(std::string domain) {
+  domain_ = std::move(domain);
+  return *this;
+}
+
+OpSchema& OpSchema::SetDomain(const char* domain) {
+  return SetDomain(std::string(domain));
+}
+
+OpSchema& OpSchema::Attr(Attribute attr) {
+  auto name = attr.name; // copy name so we can move attr in the next line
+  attributes_.insert(std::make_pair(std::move(name), std::move(attr)));
+  return *this;
+}
+
+OpSchema& OpSchema::Attr(
+    std::string name,
+    std::string description,
+    AttributeProto::AttributeType type,
+    bool required) {
+  Attr(Attribute{std::move(name), std::move(description), type, required});
+  return *this;
+}
+
+OpSchema& OpSchema::Attr(
+    const char* name,
+    const char* description,
+    AttributeProto::AttributeType type,
+    bool required) {
+  return Attr(std::string(name), std::string(description), type, required);
+}
+
+#define ATTR_SETTER_WITH_SINGLE_VALUE(type, field, attrtype)                \
+  OpSchema& OpSchema::Attr(                                                 \
+      std::string name,                                                     \
+      std::string description,                                              \
+      AttributeProto::AttributeType attr_type,                              \
+      const type& default_value) {                                          \
+    if (attrtype != attr_type) {                                            \
+      fail_schema("Attribute specification type mismatch.");                \
+    }                                                                       \
+    AttributeProto a;                                                       \
+    a.set_name(name);                                                       \
+    a.set_##field(default_value);                                           \
+    a.set_type(attr_type);                                                  \
+    Attr(Attribute(std::move(name), std::move(description), std::move(a))); \
+    return *this;                                                           \
+  }                                                                         \
+  OpSchema& OpSchema::Attr(                                                 \
+      const char* name,                                                     \
+      const char* description,                                              \
+      AttributeProto::AttributeType attr_type,                              \
+      const type& default_value) {                                          \
+    return Attr(                                                            \
+        std::string(name),                                                  \
+        std::string(description),                                           \
+        attr_type,                                                          \
+        default_value);                                                     \
+  }
+
+#define ATTR_SETTER_WITH_LIST_VALUE(type, field, attrtype)                  \
+  OpSchema& OpSchema::Attr(                                                 \
+      std::string name,                                                     \
+      std::string description,                                              \
+      AttributeProto::AttributeType attr_type,                              \
+      const std::vector<type>& default_value) {                             \
+    if (attrtype != attr_type) {                                            \
+      fail_schema("Attribute specification type mismatch.");                \
+    }                                                                       \
+    AttributeProto a;                                                       \
+    a.set_name(name);                                                       \
+    a.set_type(attr_type);                                                  \
+    for (const auto& v : default_value) {                                   \
+      a.add_##field(v);                                                     \
+    }                                                                       \
+    Attr(Attribute(std::move(name), std::move(description), std::move(a))); \
+    return *this;                                                           \
+  }
+
+#define ATTR_SETTER_WITH_SINGLE_COMPLEXVALUE(type, field, attrtype) \
+  OpSchema& OpSchema::Attr(                                         \
+      std::string name,                                             \
+      std::string description,                                      \
+      AttributeProto::AttributeType attr_type,                      \
+      const type& default_value) {                                  \
+    if (attrtype != attr_type) {                                    \
+      fail_schema("Attribute specification type mismatch.");        \
+    }                                                               \
+    AttributeProto a;                                               \
+    a.set_name(name);                                               \
+    *(a.mutable_##field()) = default_value;                         \
+    a.set_type(attr_type);                                          \
+    Attr(Attribute(std::move(name), std::move(description), a));    \
+    return *this;                                                   \
+  }
+
+#define ATTR_SETTER_WITH_LIST_COMPLEXVALUE(type, field, attrtype)           \
+  OpSchema& OpSchema::Attr(                                                 \
+      std::string name,                                                     \
+      std::string description,                                              \
+      AttributeProto::AttributeType attr_type,                              \
+      const std::vector<type>& default_value) {                             \
+    if (attrtype != attr_type) {                                            \
+      fail_schema("Attribute specification type mismatch.");                \
+    }                                                                       \
+    AttributeProto a;                                                       \
+    a.set_name(name);                                                       \
+    a.set_type(attr_type);                                                  \
+    for (const auto& v : default_value) {                                   \
+      *(a.add_##field()) = v;                                               \
+    }                                                                       \
+    Attr(Attribute(std::move(name), std::move(description), std::move(a))); \
+    return *this;                                                           \
+  }
+
+ATTR_SETTER_WITH_SINGLE_VALUE(int64_t, i, AttributeProto::INT)
+ATTR_SETTER_WITH_SINGLE_VALUE(float, f, AttributeProto::FLOAT)
+ATTR_SETTER_WITH_SINGLE_VALUE(std::string, s, AttributeProto::STRING)
+ATTR_SETTER_WITH_SINGLE_COMPLEXVALUE(TensorProto, t, AttributeProto::TENSOR)
+ATTR_SETTER_WITH_SINGLE_COMPLEXVALUE(GraphProto, g, AttributeProto::GRAPH)
+ATTR_SETTER_WITH_LIST_VALUE(int64_t, ints, AttributeProto::INTS)
+ATTR_SETTER_WITH_LIST_VALUE(float, floats, AttributeProto::FLOATS)
+ATTR_SETTER_WITH_LIST_COMPLEXVALUE(
+    std::string,
+    strings,
+    AttributeProto::STRINGS)
+ATTR_SETTER_WITH_LIST_COMPLEXVALUE(
+    TensorProto,
+    tensors,
+    AttributeProto::TENSORS)
+ATTR_SETTER_WITH_LIST_COMPLEXVALUE(GraphProto, graphs, AttributeProto::GRAPHS)
 
 OpSchema& OpSchema::AllowUncheckedAttributes() {
   allows_unchecked_attributes_ = true;
   return *this;
 }
 
-OpSchema& OpSchema::Input(const int n, const char* name, const char* description) {
-  if (int(input_desc_.size()) <= n) {
-    input_desc_.resize(n + 1);
+OpSchema& OpSchema::Input(
+    int n,
+    std::string name,
+    std::string description,
+    std::string type_str,
+    OpSchema::FormalParameterOption param_option) {
+  if (int(inputs_.size()) <= n) {
+    inputs_.resize(n + 1);
   }
-  input_desc_[n] = std::make_pair(name, description);
+  inputs_[n] = FormalParameter(std::move(name), std::move(description), std::move(type_str), param_option);
   return *this;
 }
 
-OpSchema& OpSchema::Output(const int n, const char* name, const char* description) {
-  if (int(output_desc_.size()) <= n) {
-    output_desc_.resize(n + 1);
+OpSchema& OpSchema::Input(
+    int n,
+    const char* name,
+    const char* description,
+    const char* type_str,
+    FormalParameterOption param_option) {
+  return Input(
+      n,
+      std::string(name),
+      std::string(description),
+      std::string(type_str),
+      param_option);
+}
+
+OpSchema& OpSchema::Output(
+    int n,
+    std::string name,
+    std::string description,
+    std::string type_str,
+    OpSchema::FormalParameterOption param_option) {
+  if (int(outputs_.size()) <= n) {
+    outputs_.resize(n + 1);
   }
-  output_desc_[n] = std::make_pair(name, description);
+  outputs_[n] = FormalParameter(std::move(name), std::move(description), std::move(type_str), param_option);
   return *this;
 }
 
-OpSchema& OpSchema::FillUsing(std::function<void(OpSchema&)> populator) {
+OpSchema& OpSchema::Output(
+    int n,
+    const char* name,
+    const char* description,
+    const char* type_str,
+    FormalParameterOption param_option) {
+  return Output(
+      n,
+      std::string(name),
+      std::string(description),
+      std::string(type_str),
+      param_option);
+}
+
+OpSchema& OpSchema::TypeConstraint(
+    std::string type_str,
+    std::vector<std::string> constraints,
+    std::string description) {
+  if (type_constraints_.end() != type_constraints_.find(type_str)) {
+    fail_schema("Duplicate type constraint name");
+  }
+
+  DataTypeSet d;
+  for (const auto& t : constraints) {
+    d.insert(Utils::DataTypeUtils::ToType(t));
+  }
+  type_constraints_.insert(
+      std::make_pair(type_str, std::make_pair(d, description)));
+  type_constraint_params_.push_back(
+      TypeConstraintParam(std::move(type_str), std::move(constraints), std::move(description)));
+  return *this;
+}
+
+OpSchema& OpSchema::TypeConstraint(
+    const char* type_str,
+    std::initializer_list<const char*> constraints,
+    const char* description) {
+  std::vector<std::string> constraints_vector;
+  constraints_vector.reserve(constraints.size());
+  for (auto iter = constraints.begin(); iter != constraints.end(); ++iter) {
+    constraints_vector.push_back(*iter);
+  }
+
+  return TypeConstraint(
+      std::string(type_str), constraints_vector, std::string(description));
+}
+
+void OpSchema::ParseAndSetTypes(
+    /*out*/ std::vector<OpSchema::FormalParameter>* formal_parameters) {
+  for (auto& formal_parameter : *formal_parameters) {
+    auto& type = formal_parameter.GetTypeStr();
+    DataTypeSet allowed_types;
+    auto it = type_constraints_.find(type);
+    if (it != type_constraints_.end()) {
+      allowed_types = it->second.first;
+    } else {
+      allowed_types.emplace(Utils::DataTypeUtils::ToType(type));
+    }
+
+    formal_parameter.MutableTypes() = allowed_types;
+  }
+}
+
+OpSchema& OpSchema::FillUsing(const std::function<void(OpSchema&)>& populator) {
   if (populator) {
     populator(*this);
   }
   return *this;
 }
 
-int OpSchema::CalculateOutput(int num_input) const {
-  if (min_output_ == max_output_) {
-    return min_output_;
-  } else if (calculate_output_) {
-    return calculate_output_(num_input);
-  } else {
-    return kCannotComputeNumOutputs;
+void OpSchema::Finalize() {
+#define ENFORCE(x)                                                          \
+  do {                                                                      \
+    if (!(x))                                                               \
+      throw std::logic_error(                                               \
+          "ONNX Schema " + name_ + ": failed validating the check: " + #x); \
+  } while (0)
+
+  // Calculate min/max number of inputs.
+  // <Min number of inputs> = <number of "single" inputs> + <number of
+  // "optional" but not trailing inputs>. <Max number of inputs> = <number of
+  // all inputs or std::numeric_limits<int>::max() (if the last input is
+  // variadic).
+
+  // Flag indicates whether an optional input is trailing one (there's no single
+  // or variadic input behind).
+  for (size_t i = 0; i < inputs_.size(); ++i) {
+    switch (inputs_[i].GetOption()) {
+      case OpSchema::Single:
+        ++max_input_;
+        min_input_ = max_input_;
+        break;
+      case OpSchema::Optional:
+        ++max_input_;
+        break;
+      case OpSchema::Variadic:
+        // Only last input formal parameter could be variadic.
+        ENFORCE((inputs_.size() - 1) == i);
+        min_input_ = max_input_ + 1;
+        max_input_ = std::numeric_limits<int>::max();
+        break;
+    }
   }
+
+  // Calculate min/max number of outputs.
+  for (size_t i = 0; i < outputs_.size(); ++i) {
+    switch (outputs_[i].GetOption()) {
+      case OpSchema::Single:
+        ++max_output_;
+        min_output_ = max_output_;
+        break;
+      case OpSchema::Optional:
+        ++max_output_;
+        break;
+      case OpSchema::Variadic:
+        // Only last output formal parameter could be variadic.
+        ENFORCE((outputs_.size() - 1) == i);
+        min_output_ = max_output_ + 1;
+        max_output_ = std::numeric_limits<int>::max();
+        break;
+    }
+  }
+
+  // all inputs and outputs have names
+  for (const auto& it : inputs_) {
+    ENFORCE(!(it.GetName().empty()));
+  }
+  for (const auto& it : outputs_) {
+    ENFORCE(!(it.GetName().empty()));
+  }
+
+  ParseAndSetTypes(&inputs_);
+  ParseAndSetTypes(&outputs_);
 }
 
 std::ostream& operator<<(std::ostream& out, const OpSchema& schema) {
   if (!schema.attributes_.empty()) {
     out << "Attributes:" << std::endl;
     for (const auto& pair : schema.attributes_) {
-      out << "  " << pair.second.name << " : " << pair.second.description << std::endl;
+      out << "  " << pair.second.name << " : " << pair.second.description
+          << std::endl;
     }
   }
   if (schema.max_input_ > 0) {
     out << "Inputs:" << std::endl;
-    if (!schema.input_desc_.empty()) {
-      for (size_t i = 0; i < schema.input_desc_.size(); ++i) {
-        const auto& p = schema.input_desc_[i];
-        out << "  " << i << ", " << (p.first ? p.first : "(unnamed)") << " : "
-            << (p.second ? p.second : "(no doc)") << std::endl;
+    if (!schema.inputs_.empty()) {
+      for (size_t i = 0; i < schema.inputs_.size(); ++i) {
+        const auto& p = schema.inputs_[i];
+        const auto& name = p.GetName();
+        const auto& description = p.GetDescription();
+        const auto& type_str = p.GetTypeStr();
+        out << "  " << i << ", " << ("" != name ? name : "(unnamed)") << " : "
+            << ("" != description ? description : "(no doc)") << " : "
+            << ("" != type_str ? type_str : "(no type)") << std::endl;
       }
     } else {
       out << "  (no explicit description available)" << std::endl;
@@ -447,11 +656,15 @@ std::ostream& operator<<(std::ostream& out, const OpSchema& schema) {
   }
   if (schema.max_output_ > 0) {
     out << "Outputs:" << std::endl;
-    if (!schema.output_desc_.empty()) {
-      for (size_t i = 0; i < schema.output_desc_.size(); ++i) {
-        const auto& p = schema.output_desc_[i];
-        out << "  " << i << ", " << (p.first ? p.first : "(unnamed)") << " : "
-            << (p.second ? p.second : "(no doc)") << std::endl;
+    if (!schema.outputs_.empty()) {
+      for (size_t i = 0; i < schema.outputs_.size(); ++i) {
+        const auto& p = schema.outputs_[i];
+        const auto& name = p.GetName();
+        const auto& description = p.GetDescription();
+        const auto& type_str = p.GetTypeStr();
+        out << "  " << i << ", " << ("" != name ? name : "(unnamed)") << " : "
+            << ("" != description ? description : "(no doc)") << " : "
+            << ("" != type_str ? type_str : "(no type)") << std::endl;
       }
     } else {
       out << "  (no explicit description available)" << std::endl;
@@ -470,8 +683,61 @@ std::ostream& operator<<(std::ostream& out, const OpSchema& schema) {
   return out;
 }
 
-std::unordered_map<std::string, OpSchema>& OpSchemaRegistry::map() {
-  static std::unordered_map<std::string, OpSchema> map;
+// Private method used by OpSchemaRegisterOnce and OpSchemaRegistry::map()
+OpName_Domain_Version_Schema_Map&
+OpSchemaRegistry::GetMapWithoutEnsuringRegistration() {
+  static OpName_Domain_Version_Schema_Map map;
+  return map;
+}
+
+OpName_Domain_Version_Schema_Map& OpSchemaRegistry::map() {
+  auto& map = GetMapWithoutEnsuringRegistration();
+
+  // The following class is used to register operators the
+  // first time this method is called, in a thread-safe fashion.
+  class SchemasRegisterer {
+   public:
+    SchemasRegisterer() {
+      // In debug builds, the number of schema registered in this constructor
+      // is compared against the number of calls to schema registration macros.
+#ifndef NDEBUG
+      size_t dbg_initial_schema_count = GetRegisteredSchemaCount();
+#endif
+
+      RegisterOnnxOperatorSetSchema();
+#ifdef ONNX_ML
+      RegisterOnnxMLOperatorSetSchema();
+#endif
+
+#ifndef NDEBUG
+      size_t dbg_registered_schema_count =
+          GetRegisteredSchemaCount() - dbg_initial_schema_count;
+
+      ONNX_EXPECTM(
+          dbg_registered_schema_count == ONNX_DBG_GET_COUNT_IN_OPSETS(),
+          "%u schema were exposed from operator sets and automatically placed into the static registry.  "
+          "%u were expected based on calls to registration macros. Operator set functions may need to be updated.",
+          dbg_registered_schema_count,
+          ONNX_DBG_GET_COUNT_IN_OPSETS());
+#endif
+    }
+
+   private:
+    static size_t GetRegisteredSchemaCount() {
+      size_t count = 0;
+      for (auto x : GetMapWithoutEnsuringRegistration()) {
+        for (auto y : x.second) {
+          count += y.second.size();
+        }
+      }
+      return count;
+    }
+  };
+
+#ifndef __ONNX_DISABLE_STATIC_REGISTRATION
+  static SchemasRegisterer schemasRegisterer;
+#endif
+
   return map;
 }
 
@@ -487,4 +753,4 @@ size_t ReplaceAll(std::string& s, const char* from, const char* to) {
   return numReplaced;
 }
 
-}  // namespace onnx
+} // namespace ONNX_NAMESPACE
