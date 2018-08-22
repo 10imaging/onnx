@@ -14,7 +14,8 @@ const char* pads_doc =
     "the end of axis `i`. This attribute cannot be used simultaneously with "
     "auto_pad attribute. If not present, the padding defaults to 0 along start and end of each axis.";
 const char* auto_pad_doc =
-    "auto_pad must be either SAME_UPPER, SAME_LOWER or VALID. Where "
+    "auto_pad must be either NOTSET, SAME_UPPER, SAME_LOWER or VALID. Where "
+    "default value is NOTSET, which means explicit padding is used. "
     "SAME_UPPER or SAME_LOWER mean pad the input so that the output size match the input."
     "In case of odd number add the extra padding at the end for SAME_UPPER and at the "
     "beginning for SAME_LOWER. VALID mean no padding. DEPRECATION NOTE: auto_pad is "
@@ -29,6 +30,14 @@ void convPoolTypeAndShapeInference(
     bool use_dilation,
     bool require_kernel_shape) {
   propagateElemTypeFromInputToOutput(ctx, 0, 0);
+  if (ctx.getNumOutputs() > 1) {
+    // MaxPool with two outputs case.
+    auto output_type = ctx.getOutputType(1);
+    if (output_type->value_case() == TypeProto::kTensorType ||
+        output_type->value_case() == TypeProto::VALUE_NOT_SET) {
+      output_type->mutable_tensor_type()->set_elem_type(TensorProto::INT64);
+    }
+  }
 
   // we need the first input shape for this inference.
   if (!hasNInputShapes(ctx, 1)) {
@@ -64,11 +73,6 @@ void convPoolTypeAndShapeInference(
     }
   } else {
     dilations.assign(n_input_dims, 1);
-  }
-
-  int64_t groups = getAttribute(ctx, "group", 1);
-  if (groups != 1) {
-    return; // we don't handle the group case.
   }
 
   std::vector<int64_t> pads;
@@ -145,6 +149,13 @@ void convPoolTypeAndShapeInference(
     // add in the initial position
     newdim->set_dim_value(1 + strided_kernel_positions);
   }
+
+  if (ctx.getNumOutputs() > 1) {
+    // MaxPool with two outputs case.
+    auto second_output_shape =
+      ctx.getOutputType(1)->mutable_tensor_type()->mutable_shape();
+    second_output_shape->CopyFrom(*output_shape);
+  }
 }
 
 std::function<void(OpSchema&)> PoolOpSchemaGenerator(
@@ -153,7 +164,7 @@ std::function<void(OpSchema&)> PoolOpSchemaGenerator(
     const char* additionalDescription) {
   return [=](OpSchema& schema) {
     std::string doc = R"DOC(
- {name} consumes an input tensor X and applies {opName} pooling across the
+ {name} consumes an input tensor X and applies {opName} pooling across
  the tensor according to kernel sizes, stride sizes, and pad lengths.
  {opName} pooling consisting of computing the {opName} on all values of a
  subset of the input tensor according to the kernel size and downsampling the
@@ -257,13 +268,42 @@ ONNX_OPERATOR_SET_SCHEMA(
         "max",
         "The output of each pooling window is maximum number of elements exclude pad.")));
 
+ONNX_OPERATOR_SET_SCHEMA(
+    MaxPool,
+    8,
+    OpSchema()
+        .FillUsing(PoolOpSchemaGenerator(
+            "MaxPool",
+            "max",
+            "The output of each pooling window is maximum number of elements exclude pad."))
+        .Attr(
+            "storage_order",
+            "The storage order of the tensor. 0 is row major, and 1 is column major. Default is 0.",
+            AttributeProto::INT,
+            static_cast<int64_t>(0))
+        .Output(
+            1,
+            "Indices",
+            "Indices tensor from max pooling across the input tensor. "
+            "The dimensions of indices are the same as output tensor. "
+            "The values in indices of are the indices of the selected values during pooling. "
+            "The indices are computed as flatten 1-D tensor, "
+            "and the indices do not consider padding. "
+            "So the values in indices are in [0, N x C x D1 x ... x Dn).",
+            "I",
+            OpSchema::Optional)
+        .TypeConstraint(
+            "I",
+            {"tensor(int64)"},
+            "Constrain index tensor to int64"));
+
 } // namespace ONNX_NAMESPACE
 
 namespace ONNX_NAMESPACE {
 std::function<void(OpSchema&)> LpPoolOpSchemaGenerator(const char* name) {
   return [=](OpSchema& schema) {
     std::string doc = R"DOC(
- {name} consumes an input tensor X and applies Lp pooling across the
+ {name} consumes an input tensor X and applies Lp pooling across
  the tensor according to kernel sizes, stride sizes, and pad lengths.
  Lp pooling consisting of computing the Lp norm on all values of a subset
  of the input tensor according to the kernel size and downsampling the
@@ -276,7 +316,7 @@ std::function<void(OpSchema&)> LpPoolOpSchemaGenerator(const char* name) {
         AttributeProto::INTS);
     schema.Attr(
         "strides",
-        "Stride along each axis. If not present, the stride defaults to 0 along each axis.",
+        "Stride along each axis. If not present, the stride defaults to 1 along each axis.",
         AttributeProto::INTS,
         OPTIONAL);
     schema.Attr(
@@ -446,16 +486,19 @@ computes the output.)DOC";
         1,
         "W",
         "The weight tensor that will be used in the "
-        "convolutions; has size (M x C x kH x kW), where C "
+        "convolutions; has size (M x C/group x kH x kW), where C "
         "is the number of channels, and kH and kW are the "
         "height and width of the kernel, and M is the number "
         "of feature maps. For more than 2 dimensions, the "
-        "kernel shape will be (M x C x k1 x k2 x ... x kn), "
+        "kernel shape will be (M x C/group x k1 x k2 x ... x kn), "
         "where (k1 x k2 x ... kn) is the dimension of the kernel. "
         "Optionally, if dimension denotation is in effect, "
         "the operation expects the weight tensor to arrive "
-        "with the dimension denotation of [FILTER_IN_CHANNEL, "
-        "FILTER_OUT_CHANNEL, FILTER_SPATIAL, FILTER_SPATIAL ...].",
+        "with the dimension denotation of [FILTER_OUT_CHANNEL, "
+        "FILTER_IN_CHANNEL, FILTER_SPATIAL, FILTER_SPATIAL ...]. "
+        "X.shape[1] == (W.shape[1] * group) == C "
+        "(assuming zero based indices for the shape array). "
+        "Or in other words FILTER_IN_CHANNEL should be equal to DATA_CHANNEL. ",
         "T");
     schema.Input(
         2,
@@ -533,11 +576,6 @@ void convTransposeShapeInference(InferenceContext& ctx) {
 
   // first dim is the batch axis and the next is the number of channels.
   size_t n_input_dims = static_cast<size_t>(input_shape.dim_size() - 2);
-
-  int64_t groups = getAttribute(ctx, "group", 1);
-  if (groups != 1) {
-    return; // we don't handle the group case.
-  }
 
   std::vector<int64_t> dilations;
   if (getRepeatedAttribute(ctx, "dilations", dilations)) {
@@ -666,12 +704,14 @@ output_shape can also be explicitly specified in which case pads values are auto
         1,
         "W",
         "The weight tensor that will be used in the "
-        "convolutions; has size (C x M x kH x kW), where C "
+        "convolutions; has size (C x M/group x kH x kW), where C "
         "is the number of channels, and kH and kW are the "
         "height and width of the kernel, and M is the number "
         "of feature maps. For more than 2 dimensions, the "
-        "weight shape will be (C x M x k1 x k2 x ... x kn), "
-        "where (k1 x k2 x ... x kn) is the dimension of the kernel",
+        "weight shape will be (C x M/group x k1 x k2 x ... x kn), "
+        "where (k1 x k2 x ... x kn) is the dimension of the kernel. "
+        "The number of channels in the output should be equal to W.shape[1] * group "
+        "(assuming zero based indices of the shape array)",
         "T");
     schema.Input(
         2,
@@ -684,7 +724,9 @@ output_shape can also be explicitly specified in which case pads values are auto
         "Y",
         "Output data tensor that contains the result of the convolution. The "
         "output dimensions are functions of the kernel size, stride size, "
-        "and pad lengths.",
+        "pad lengths and group count. "
+        "The number of channels in the output should be equal to W.shape[1] * group "
+        "(assuming zero based indices of the shape array)",
         "T");
     schema.TypeConstraint(
         "T",
@@ -774,7 +816,7 @@ std::function<void(OpSchema&)> GlobalPoolingOpSchemaGenerator(
     const char* op) {
   return [=](OpSchema& schema) {
     std::string doc = R"DOC(
- Global{op_type} consumes an input tensor X and applies {op} pooling across the
+ Global{op_type} consumes an input tensor X and applies {op} pooling across
  the values in the same channel. This is equivalent to {op_type} with kernel size
  equal to the spatial dimension of input tensor.)DOC";
     ReplaceAll(doc, "{op_type}", op_type);
@@ -820,7 +862,7 @@ std::function<void(OpSchema&)> GlobalLpPoolingOpSchemaGenerator(
     const char* op) {
   return [=](OpSchema& schema) {
     std::string doc = R"DOC(
- Global{op_type} consumes an input tensor X and applies {op} pooling across the
+ Global{op_type} consumes an input tensor X and applies {op} pooling across
  the values in the same channel. This is equivalent to {op_type} with kernel size
  equal to the spatial dimension of input tensor.)DOC";
     ReplaceAll(doc, "{op_type}", op_type);

@@ -5,6 +5,7 @@ from __future__ import unicode_literals
 
 from onnx import checker, helper, ModelProto, TensorProto, GraphProto, NodeProto
 from typing import Sequence, Text, Tuple, List, Callable
+from onnx import numpy_helper
 
 import numpy as np  # type: ignore
 
@@ -80,6 +81,15 @@ class TestOptimizer(unittest.TestCase):
                 if len(attr.graphs):
                     for gr in attr.graphs:
                         self._visit_all_nodes_recursive(gr, fn)
+
+    def test_get_available_passes(self):  # type: () -> None
+        # FIXME does not garantees to be listing all
+        graph = helper.make_graph([], "dummy_graph", [], [])
+        list_of_passes = onnx.optimizer.get_available_passes()
+        assert isinstance(list_of_passes, (list)) and len(list_of_passes) > 0
+        for pass_name in list_of_passes:
+            # If pass_name is invalid it throws a RuntimeError
+            self._optimized(graph, [pass_name])
 
     def test_eliminate_identity_single_use(self):  # type: () -> None
         nodes = [helper.make_node("Identity", ["X"], ["Y"])]
@@ -161,6 +171,35 @@ class TestOptimizer(unittest.TestCase):
 
         assert len(list(optimized_model.graph.node)) == 1
         assert optimized_model.graph.node[0].op_type == "Transpose"
+
+    def test_nop_pad(self):  # type: () -> None
+        nodes = [helper.make_node("Pad", ["X"], ["Y"], pads=[0, 0])]
+        graph = helper.make_graph(
+            nodes,
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3))],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, (2, 3))])
+        assert len(graph.node) == 1
+        optimized_model = self._optimized(graph, ["eliminate_nop_pad"])
+
+        def check_pad(node):  # type: (NodeProto) -> None
+            assert node.op_type != "Pad"
+        self._visit_all_nodes_recursive(optimized_model.graph, check_pad)
+        assert len(optimized_model.graph.output) == 1
+        assert optimized_model.graph.output[0].name == "X"
+        assert len(optimized_model.graph.node) == 0
+
+    def test_nop_pad_default(self):  # type: () -> None
+        trans = helper.make_node("Pad", ["X"], ["Y"], pads=[0, 1])
+        graph = helper.make_graph(
+            [trans],
+            "test",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3))],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, (2, 4))])
+        optimized_model = self._optimized(graph, ["eliminate_nop_pad"])
+
+        assert len(list(optimized_model.graph.node)) == 1
+        assert optimized_model.graph.node[0].op_type == "Pad"
 
     def test_eliminate_unused_initializer(self):  # type: () -> None
         add = helper.make_node("Add", ["X", "Y"], ["Z"])
@@ -267,7 +306,7 @@ class TestOptimizer(unittest.TestCase):
                                     value=helper.make_tensor(
                                         name="bias",
                                         data_type=TensorProto.FLOAT,
-                                        dims=(16,),
+                                        dims=(16, 1, 1),
                                         vals=np.random.randn(16).astype(np.float32).tolist()))
         add = helper.make_node("Add", ["Z", "A"], ["B"])
         graph = helper.make_graph(
@@ -275,7 +314,7 @@ class TestOptimizer(unittest.TestCase):
             "test",
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 3, 3)),
              helper.make_tensor_value_info("Y", TensorProto.FLOAT, (16, 5, 3, 3))],
-            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 3, 3))],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 1, 1))],
         )
         optimized_model = self._optimized(graph, ["extract_constant_to_initializer"])
         self.assertEqual(
@@ -285,7 +324,7 @@ class TestOptimizer(unittest.TestCase):
         self.assertEqual(len(optimized_model.graph.initializer), 1)
         init = optimized_model.graph.initializer[0]
         self.assertEqual(init.name, 'A')
-        self.assertEqual(init.dims, [16])
+        self.assertEqual(init.dims, [16, 1, 1])
         self.assertEqual(init.data_type, TensorProto.FLOAT)
 
         self.assertEqual([n.op_type for n in optimized_model.graph.node], ['Conv', 'Add'])
@@ -383,7 +422,7 @@ class TestOptimizer(unittest.TestCase):
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 3, 3)),
              helper.make_tensor_value_info("Y", TensorProto.FLOAT, (16, 5, 3, 3)),
              helper.make_tensor_value_info("A", TensorProto.FLOAT, (16, 1, 1))],
-            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 3, 3))],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 1, 1))],
         )
         optimized_model = self._optimized(graph, ["fuse_add_bias_into_conv"])
 
@@ -408,7 +447,7 @@ class TestOptimizer(unittest.TestCase):
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 3, 3)),
              helper.make_tensor_value_info("Y", TensorProto.FLOAT, (16, 5, 3, 3)),
              helper.make_tensor_value_info("A", TensorProto.FLOAT, (1,))],
-            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 3, 3))],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 1, 1))],
         )
         optimized_model = self._optimized(graph, ["fuse_add_bias_into_conv"])
 
@@ -432,9 +471,9 @@ class TestOptimizer(unittest.TestCase):
              helper.make_tensor_value_info("M", TensorProto.FLOAT, (16, 5, 3, 3)),
              helper.make_tensor_value_info("N", TensorProto.FLOAT, (16, 5, 3, 3)),
              helper.make_tensor_value_info("A", TensorProto.FLOAT, (1, 16, 1, 1))],
-            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 3, 3))],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 1, 1))],
             value_info=[
-                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 3, 3))
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 1, 1))
             ],
         )
         optimized_model = self._optimized(graph, ["fuse_add_bias_into_conv"])
@@ -453,7 +492,7 @@ class TestOptimizer(unittest.TestCase):
                                     value=helper.make_tensor(
                                         name="bias",
                                         data_type=TensorProto.FLOAT,
-                                        dims=(16,),
+                                        dims=(16, 1, 1),
                                         vals=np.random.randn(16).astype(np.float32).tolist()))
         add = helper.make_node("Add", ["Z", "A"], ["B"])
         graph = helper.make_graph(
@@ -461,7 +500,7 @@ class TestOptimizer(unittest.TestCase):
             "test",
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 3, 3)),
              helper.make_tensor_value_info("Y", TensorProto.FLOAT, (16, 5, 3, 3))],
-            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 3, 3))],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 1, 1))],
             value_info=[
                 helper.make_tensor_value_info("A", TensorProto.FLOAT, (16, 1, 1)),
             ]
@@ -485,9 +524,9 @@ class TestOptimizer(unittest.TestCase):
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, (1, 5, 3, 3)),
              helper.make_tensor_value_info("Y", TensorProto.FLOAT, (16, 5, 3, 3)),
              helper.make_tensor_value_info("A", TensorProto.FLOAT, (3,))],
-            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 3, 3))],
+            [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 1, 3))],
             value_info=[
-                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 3, 3)),
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 1, 1)),
             ]
         )
         optimized_model = self._optimized(graph, ["fuse_add_bias_into_conv"])
@@ -507,7 +546,7 @@ class TestOptimizer(unittest.TestCase):
              helper.make_tensor_value_info("A", TensorProto.FLOAT, (16, 3, 3))],
             [helper.make_tensor_value_info("B", TensorProto.FLOAT, (1, 16, 3, 3))],
             value_info=[
-                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 3, 3)),
+                helper.make_tensor_value_info("Z", TensorProto.FLOAT, (1, 16, 1, 1)),
             ]
         )
         optimized_model = self._optimized(graph, ["fuse_add_bias_into_conv"])
@@ -621,7 +660,7 @@ class TestOptimizer(unittest.TestCase):
             [trans1, trans2, trans3],
             "test",
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, (2, 3, 4))],
-            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (4, 3, 2))])
+            [helper.make_tensor_value_info("A", TensorProto.FLOAT, (2, 4, 3))])
         vi = helper.make_tensor_value_info("Y", TensorProto.FLOAT, (3, 2, 4))
 
         graph.value_info.extend([vi])
@@ -706,6 +745,50 @@ class TestOptimizer(unittest.TestCase):
         assert optimized_model.graph.node[2].attribute[2].name == "__control_inputs"
         assert optimized_model.graph.node[2].attribute[2].strings[0] == b"X"
         assert optimized_model.graph.node[2].attribute[2].strings[1] == b"Y"
+
+    def test_fuse_bn_into_conv_simple(self):  # type: () -> None
+        for (tensor_type, np_type) in [(TensorProto.FLOAT, np.float32), (TensorProto.DOUBLE, np.float64)]:
+            conv = helper.make_node("Conv", ["X", "W", "B"], ["Y"])
+            bn = helper.make_node("BatchNormalization", ["Y", "scale", "b", "mean", "var"], ["Z"])
+
+            W = np.random.randn(3, 2, 5, 5).astype(np_type) + 2
+            B = np.random.randn(3,).astype(np_type) + 2
+            scale = np.random.randn(3,).astype(np_type) + 2
+            b = np.random.randn(3,).astype(np_type) + 2
+            mean = np.random.randn(3,).astype(np_type) + 2
+            var = np.abs(np.random.randn(3,).astype(np_type)) + 2
+
+            initializers = [
+                helper.make_tensor(name, tensor_type, npa.shape, npa.tobytes(), raw=True)
+                for name, npa in [('W', W), ('B', B), ('scale', scale), ('b', b), ('mean', mean), ('var', var)]
+            ]
+            graph = helper.make_graph(
+                [conv, bn],
+                "test",
+                [helper.make_tensor_value_info("X", tensor_type, (5, 2, 28, 28)),
+                 helper.make_tensor_value_info("W", tensor_type, (3, 2, 5, 5)),
+                 helper.make_tensor_value_info("B", tensor_type, (3,)),
+                 helper.make_tensor_value_info("scale", tensor_type, (3,)),
+                 helper.make_tensor_value_info("b", tensor_type, (3,)),
+                 helper.make_tensor_value_info("mean", tensor_type, (3,)),
+                 helper.make_tensor_value_info("var", tensor_type, (3,))],
+                [helper.make_tensor_value_info("Z", tensor_type, (5, 3, 24, 24))],
+                initializer=initializers,
+                value_info=[
+                    helper.make_tensor_value_info("Y", tensor_type, (5, 3, 24, 24))
+                ]
+            )
+            optimized_model = self._optimized(graph, ["fuse_bn_into_conv"])
+
+            self.assertEqual(len(optimized_model.graph.node), 1)
+            self.assertEqual(optimized_model.graph.node[0].op_type, 'Conv')
+            self.assertEqual(len(optimized_model.graph.initializer), 2)
+            new_W = numpy_helper.to_array(optimized_model.graph.initializer[0])
+            new_b = numpy_helper.to_array(optimized_model.graph.initializer[1])
+
+            f = scale / np.sqrt(var + 1e-5)
+            np.testing.assert_almost_equal((B - mean) * f + b, new_b)
+            np.testing.assert_almost_equal(W * f[:, np.newaxis, np.newaxis, np.newaxis], new_W)
 
 
 if __name__ == '__main__':

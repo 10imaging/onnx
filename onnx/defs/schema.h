@@ -437,34 +437,37 @@ class OpSchema final {
 
   static const std::vector<std::string>& all_numeric_types() {
     static const std::vector<std::string> all_numeric_types = {
-        +"tensor(uint8)",
-        +"tensor(uint16)",
-        +"tensor(uint32)",
-        +"tensor(uint64)",
-        +"tensor(int8)",
-        +"tensor(int16)",
-        +"tensor(int32)",
-        +"tensor(int64)",
-        +"tensor(float16)",
-        +"tensor(float)",
-        +"tensor(double)"};
+        "tensor(uint8)",
+        "tensor(uint16)",
+        "tensor(uint32)",
+        "tensor(uint64)",
+        "tensor(int8)",
+        "tensor(int16)",
+        "tensor(int32)",
+        "tensor(int64)",
+        "tensor(float16)",
+        "tensor(float)",
+        "tensor(double)"};
     return all_numeric_types;
   }
 
   static const std::vector<std::string>& all_tensor_types() {
-    static const std::vector<std::string> all_tensor_types = {"tensor(uint8)",
-                                                              "tensor(uint16)",
-                                                              "tensor(uint32)",
-                                                              "tensor(uint64)",
-                                                              "tensor(int8)",
-                                                              "tensor(int16)",
-                                                              "tensor(int32)",
-                                                              "tensor(int64)",
-                                                              "tensor(float16)",
-                                                              "tensor(float)",
-                                                              "tensor(double)",
-                                                              "tensor(string)",
-                                                              "tensor(bool)"};
+    static const std::vector<std::string> all_tensor_types = {
+        "tensor(uint8)",
+        "tensor(uint16)",
+        "tensor(uint32)",
+        "tensor(uint64)",
+        "tensor(int8)",
+        "tensor(int16)",
+        "tensor(int32)",
+        "tensor(int64)",
+        "tensor(float16)",
+        "tensor(float)",
+        "tensor(double)",
+        "tensor(string)",
+        "tensor(bool)",
+        "tensor(complex64)",
+        "tensor(complex128)"};
     return all_tensor_types;
   }
 
@@ -478,9 +481,6 @@ class OpSchema final {
     return domain_;
   }
 
-  int since_version() const {
-    return since_version_;
-  }
   const std::map<std::string, Attribute>& attributes() const {
     return attributes_;
   }
@@ -504,6 +504,10 @@ class OpSchema final {
   }
 
   OperatorSetVersion SinceVersion() const {
+    return since_version_;
+  }
+
+  int since_version() const {
     return since_version_;
   }
 
@@ -586,7 +590,7 @@ class OpSchemaRegistry final : public ISchemaRegistry {
       // Increase the highest version when you make BC-breaking changes to the
       // operator schema on specific domain. Update the lowest version when it's
       // determined to remove too old version history.
-      map_[ONNX_DOMAIN] = std::make_pair(1, 7);
+      map_[ONNX_DOMAIN] = std::make_pair(1, 8);
       map_[AI_ONNX_ML_DOMAIN] = std::make_pair(1, 1);
     }
 
